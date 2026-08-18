@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 from typing import Optional, List
-from fastapi import FastAPI,Depends, HTTPException,WebSocketDisconnect,WebSocket
+from fastapi import FastAPI,Depends, HTTPException,WebSocketDisconnect,WebSocket,Query
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -109,7 +109,31 @@ class UserCreate(SQLModel):
     email: str
 class RefreshRequest(BaseModel):
     refresh_token: str
+class RoomCreate(SQLModel):
+    name: str
+class ConnectionManager:
+    def __init__(self):
+        # room_id -> liste de WebSocket connectés à ce salon
+        self.active_connections: dict[int, list[WebSocket]] = {}
 
+    async def connect(self, room_id: int, websocket: WebSocket):
+        await websocket.accept()
+        if room_id not in self.active_connections:
+            self.active_connections[room_id] = []
+        self.active_connections[room_id].append(websocket)
+
+    def disconnect(self, room_id: int, websocket: WebSocket):
+        if room_id in self.active_connections:
+            self.active_connections[room_id].remove(websocket)
+            if not self.active_connections[room_id]:
+                del self.active_connections[room_id]
+
+    async def broadcast(self, room_id: int, message: str):
+        if room_id in self.active_connections:
+            for connection in self.active_connections[room_id]:
+                await connection.send_text(message)
+
+manager = ConnectionManager()
 #APP SETUP
 
 app = FastAPI()
@@ -162,13 +186,55 @@ async def refresh_access_token(body: RefreshRequest, session: Session = Depends(
 #WebSocket connexions
 
 @app.websocket("/ws/{room_id}")
-async def websocket_endpoint(websocket:WebSocket,room_id:int):
-    await websocket.accept()
+async def websocket_endpoint(websocket:WebSocket,room_id:int,token:str=Query(...),session:Session=Depends(get_session)):
+    try:
+        payload=jwt.decode(token,SECRET_KEY,ALGORITHM)
+        username=payload.get("sub")
+        if username is None:
+            await websocket.close(code=1008) #1008 policy violation
+            return
+    except JWTError:
+        await websocket.close(code=1008)
+        return
+    
+    user = session.exec(select(User).where(User.username == username)).first()
+    if user is None:
+        await websocket.close(code=1008)
+        return
+    await manager.connect(room_id, websocket)
+    await manager.broadcast(room_id, f"🟢 {user.username} a rejoint le salon")
+
     print(f"Client connecté au salon {room_id}")
     try:
         while True:
             data=await websocket.receive_text()
-            print(f"Reçu: {data}")
-            await websocket.send_text(f"Echo depuis {room_id}: {data}")
+            await manager.broadcast(room_id, f"{user.username}: {data}")
     except WebSocketDisconnect:
-        print(f"Client déconnecté du salon {room_id}")    
+        manager.disconnect(room_id, websocket)
+        await manager.broadcast(room_id, f"🔴 {user.username} a quitté le salon")   
+
+# ROOM CRUD 
+  
+@app.post("/rooms")
+async def create_room(
+    room: RoomCreate,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    db_room = Room(name=room.name, owner_id=current_user.id)
+    session.add(db_room)
+    session.commit()
+    session.refresh(db_room)
+    return db_room
+
+@app.get("/rooms")
+async def get_rooms(session: Session = Depends(get_session)):
+    rooms = session.exec(select(Room)).all()
+    return rooms
+
+@app.get("/rooms/{room_id}")
+async def get_room(room_id: int, session: Session = Depends(get_session)):
+    room = session.get(Room, room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="room not found")
+    return room

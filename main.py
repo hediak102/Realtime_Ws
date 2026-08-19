@@ -108,6 +108,7 @@ class MessageRead(SQLModel):
     content: str
     created_at: datetime
     user_id: int
+    username:str
     room_id: int
 class UserCreate(SQLModel):
     username:str
@@ -117,6 +118,10 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 class RoomCreate(SQLModel):
     name: str
+class UserRead(SQLModel):
+    id: int
+    username: str
+    email: str
 class ConnectionManager:
     def __init__(self):
         # room_id -> liste de WebSocket connectés à ce salon
@@ -139,20 +144,44 @@ class ConnectionManager:
         if room_id not in self.active_connections:
             return []
         return [name for _, name in self.active_connections[room_id]]
-    async def broadcast(self, room_id: int, message:dict,exclude:WebSocket=None):
+    async def broadcast(self, room_id: int, message: dict, exclude: WebSocket = None):
         if room_id in self.active_connections:
-            for connection,username in self.active_connections[room_id]:
-                if connection !=exclude:
-                    await connection.send_json(message)
+            dead_connections = []
+            for connection, username in self.active_connections[room_id]:
+                if connection != exclude:
+                    try:
+                        await connection.send_json(message)
+                    except Exception:
+                        dead_connections.append((connection, username))
+
+            # Nettoie les connexions mortes détectées pendant le broadcast
+            for dead in dead_connections:
+                self.active_connections[room_id].remove(dead)
 
 manager = ConnectionManager()
 #APP SETUP
 
 app = FastAPI()
+origins = [
+    "http://localhost:5173",
+    "https://chat-frontend-86mu.onrender.com",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 async def read_root():
     return {"message": "api is running"}
+
+@app.get("/me", response_model=UserRead)
+async def get_me(current_user: User = Depends(get_current_user)):
+    return current_user
 
 # APP-JWT-AUTH2-REQUESTS
 @app.post("/register")
@@ -296,4 +325,15 @@ async def get_room_messages(
     messages = session.exec(
         select(Message).where(Message.room_id == room_id).order_by(Message.created_at)
     ).all()
-    return messages
+    result = []
+    for m in messages:
+        author = session.get(User, m.user_id)
+        result.append(MessageRead(
+            id=m.id,
+            content=m.content,
+            created_at=m.created_at,
+            user_id=m.user_id,
+            username=author.username if author else "inconnu",
+            room_id=m.room_id,
+        ))
+    return result

@@ -103,6 +103,12 @@ class Message(SQLModel,table=True):
     created_at:datetime = Field(default_factory=datetime.utcnow)
     user_id:int=Field(foreign_key="user.id")
     room_id:int=Field(foreign_key="room.id")
+class MessageRead(SQLModel):
+    id: int
+    content: str
+    created_at: datetime
+    user_id: int
+    room_id: int
 class UserCreate(SQLModel):
     username:str
     password:str
@@ -114,24 +120,30 @@ class RoomCreate(SQLModel):
 class ConnectionManager:
     def __init__(self):
         # room_id -> liste de WebSocket connectés à ce salon
-        self.active_connections: dict[int, list[WebSocket]] = {}
+        self.active_connections: dict[int, list[tuple[WebSocket,str]]] = {}
 
-    async def connect(self, room_id: int, websocket: WebSocket):
+    async def connect(self, room_id: int, websocket: WebSocket,username:str):
         await websocket.accept()
         if room_id not in self.active_connections:
             self.active_connections[room_id] = []
-        self.active_connections[room_id].append(websocket)
+        self.active_connections[room_id].append((websocket,username))
 
     def disconnect(self, room_id: int, websocket: WebSocket):
         if room_id in self.active_connections:
-            self.active_connections[room_id].remove(websocket)
+            self.active_connections[room_id] = [
+                (ws, name) for ws, name in self.active_connections[room_id] if ws != websocket
+            ]
             if not self.active_connections[room_id]:
                 del self.active_connections[room_id]
-
-    async def broadcast(self, room_id: int, message: str):
+    def get_usernames(self, room_id: int) -> list[str]:
+        if room_id not in self.active_connections:
+            return []
+        return [name for _, name in self.active_connections[room_id]]
+    async def broadcast(self, room_id: int, message:dict,exclude:WebSocket=None):
         if room_id in self.active_connections:
-            for connection in self.active_connections[room_id]:
-                await connection.send_text(message)
+            for connection,username in self.active_connections[room_id]:
+                if connection !=exclude:
+                    await connection.send_json(message)
 
 manager = ConnectionManager()
 #APP SETUP
@@ -188,7 +200,7 @@ async def refresh_access_token(body: RefreshRequest, session: Session = Depends(
 @app.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket:WebSocket,room_id:int,token:str=Query(...),session:Session=Depends(get_session)):
     try:
-        payload=jwt.decode(token,SECRET_KEY,ALGORITHM)
+        payload=jwt.decode(token,SECRET_KEY,algorithms=[ALGORITHM])
         username=payload.get("sub")
         if username is None:
             await websocket.close(code=1008) #1008 policy violation
@@ -201,17 +213,48 @@ async def websocket_endpoint(websocket:WebSocket,room_id:int,token:str=Query(...
     if user is None:
         await websocket.close(code=1008)
         return
-    await manager.connect(room_id, websocket)
-    await manager.broadcast(room_id, f"🟢 {user.username} a rejoint le salon")
-
-    print(f"Client connecté au salon {room_id}")
+    
+    room = session.get(Room, room_id)
+    if room is None:
+        await websocket.close(code=1008)
+        return
+    
+    await manager.connect(room_id, websocket,user.username)
+    await manager.broadcast(room_id, {
+        "type": "user_joined",
+        "username": user.username,
+        "online_users": manager.get_usernames(room_id),
+    })
     try:
         while True:
-            data=await websocket.receive_text()
-            await manager.broadcast(room_id, f"{user.username}: {data}")
+            raw=await websocket.receive_json()
+            event_type = raw.get("type")
+            if event_type=="message":
+                content = raw.get("content", "")
+
+                #SAUVEGARDER MSG EN BD 
+                new_message = Message(content=content, user_id=user.id, room_id=room_id)
+                session.add(new_message)
+                session.commit()
+
+                await manager.broadcast(room_id, {
+                    "type": "message",
+                    "username": user.username,
+                    "content": content,
+                })
+            elif event_type == "typing":
+                await manager.broadcast(
+                    room_id,
+                    {"type": "typing", "username": user.username},
+                    exclude=websocket,
+                )
     except WebSocketDisconnect:
         manager.disconnect(room_id, websocket)
-        await manager.broadcast(room_id, f"🔴 {user.username} a quitté le salon")   
+        await manager.broadcast(room_id, {
+            "type": "user_left",
+            "username": user.username,
+            "online_users": manager.get_usernames(room_id),
+        }) 
 
 # ROOM CRUD 
   
@@ -238,3 +281,19 @@ async def get_room(room_id: int, session: Session = Depends(get_session)):
     if not room:
         raise HTTPException(status_code=404, detail="room not found")
     return room
+
+# CHARGER HISTORIQUE DE MSG
+@app.get("/rooms/{room_id}/messages", response_model=List[MessageRead])
+async def get_room_messages(
+    room_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    room = session.get(Room, room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="room not found")
+
+    messages = session.exec(
+        select(Message).where(Message.room_id == room_id).order_by(Message.created_at)
+    ).all()
+    return messages

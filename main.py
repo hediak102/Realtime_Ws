@@ -360,14 +360,15 @@ async def get_room_messages(
     room_id: int,
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
+    skip:int=0,
+    limit:int=10
 ):
     room = session.get(Room, room_id)
     if not room:
         raise HTTPException(status_code=404, detail="room not found")
 
-    messages = session.exec(
-        select(Message).where(Message.room_id == room_id).order_by(Message.created_at)
-    ).all()
+    query = select(Message).where(Message.room_id == room_id).order_by(Message.created_at).offset(skip).limit(limit)
+    messages=session.exec(query).all()
     result = []
     for m in messages:
         author = session.get(User, m.user_id)

@@ -143,6 +143,9 @@ class ConnectionManager:
         if room_id not in self.local_connections:
             self.local_connections[room_id] = []
         self.local_connections[room_id].append(websocket)
+
+        # Incrémente le nombre de connexions actives pour cet utilisateur dans cette room
+        await redis_client.hincrby(f"room:{room_id}:user_count", username, 1)
         await redis_client.sadd(f"room:{room_id}:online", username)
 
         # Démarre le listener SEULEMENT s'il n'existe pas déjà pour ce salon
@@ -175,7 +178,14 @@ class ConnectionManager:
                     await self.pubsubs[room_id].unsubscribe(f"room:{room_id}:channel")
                     del self.pubsubs[room_id]
 
-        await redis_client.srem(f"room:{room_id}:online", username)
+        # Décrémente le compteur de connexions
+        count = await redis_client.hincrby(f"room:{room_id}:user_count", username, -1)
+        # Supprime de la liste 'online' SEULEMENT s'il n'a plus d'autres onglets/sockets ouverts
+        if count <= 0:
+            await redis_client.srem(f"room:{room_id}:online", username)
+            await redis_client.hdel(f"room:{room_id}:user_count", username)
+            return True # Vrai si l'utilisateur est totalement déconnecté de la room
+        return False # Faux si l'utilisateur a toujours une connexion active
 
     async def get_usernames(self, room_id: int) -> list[str]:
         members = await redis_client.smembers(f"room:{room_id}:online")
@@ -265,7 +275,6 @@ async def refresh_access_token(body: RefreshRequest, session: Session = Depends(
 #WebSocket connexions
 
 @app.websocket("/ws/{room_id}")
-@app.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: int, token: str = Query(...), session: Session = Depends(get_session)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -318,15 +327,17 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, token: str = Qu
                     "username": user.username,
                 })
     except WebSocketDisconnect:
-        pass
+       pass
     finally:
-        await manager.disconnect(room_id, websocket, user.username)
-        online_users = await manager.get_usernames(room_id)
-        await manager.publish(room_id, {
-            "type": "user_left",
-            "username": user.username,
-            "online_users": online_users,
-        })
+        is_fully_disconnected = await manager.disconnect(room_id, websocket, user.username)
+        # N'envoie 'user_left' que si l'utilisateur n'a plus AUCUN onglet/socket ouvert dans la room
+        if is_fully_disconnected:
+            online_users = await manager.get_usernames(room_id)
+            await manager.publish(room_id, {
+                "type": "user_left",
+                "username": user.username,
+                "online_users": online_users,
+            })
 
 # ROOM CRUD 
   
@@ -367,8 +378,9 @@ async def get_room_messages(
     if not room:
         raise HTTPException(status_code=404, detail="room not found")
 
-    query = select(Message).where(Message.room_id == room_id).order_by(Message.created_at).offset(skip).limit(limit)
+    query = select(Message).where(Message.room_id == room_id).order_by(Message.created_at.desc()).offset(skip).limit(limit)
     messages=session.exec(query).all()
+    messages.reverse()
     result = []
     for m in messages:
         author = session.get(User, m.user_id)

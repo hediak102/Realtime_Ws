@@ -9,9 +9,19 @@ from jose import jwt, JWTError
 import os
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-
+import redis.asyncio as redis
+import json
+import asyncio
 
 load_dotenv()
+
+#REDIS SETUP
+REDIS_URL = os.getenv("REDIS_URL")
+if not REDIS_URL:
+    raise RuntimeError("REDIS_URL is not set")
+
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
 #DB SETUP
 DATABASE_URL = os.getenv("DATABASE_URL","sqlite:///database.db")
 if not DATABASE_URL:
@@ -124,39 +134,67 @@ class UserRead(SQLModel):
     email: str
 class ConnectionManager:
     def __init__(self):
-        # room_id -> liste de WebSocket connectés à ce salon
-        self.active_connections: dict[int, list[tuple[WebSocket,str]]] = {}
+        self.local_connections: dict[int, list[WebSocket]] = {}
+        self.redis_listener_tasks: dict[int, asyncio.Task] = {}
+        self.pubsubs: dict[int, any] = {}
 
-    async def connect(self, room_id: int, websocket: WebSocket,username:str):
+    async def connect(self, room_id: int, websocket: WebSocket, username: str):
         await websocket.accept()
-        if room_id not in self.active_connections:
-            self.active_connections[room_id] = []
-        self.active_connections[room_id].append((websocket,username))
+        if room_id not in self.local_connections:
+            self.local_connections[room_id] = []
+        self.local_connections[room_id].append(websocket)
+        await redis_client.sadd(f"room:{room_id}:online", username)
 
-    def disconnect(self, room_id: int, websocket: WebSocket):
-        if room_id in self.active_connections:
-            self.active_connections[room_id] = [
-                (ws, name) for ws, name in self.active_connections[room_id] if ws != websocket
+        # Démarre le listener SEULEMENT s'il n'existe pas déjà pour ce salon
+        if room_id not in self.redis_listener_tasks:
+            pubsub = redis_client.pubsub()
+            await pubsub.subscribe(f"room:{room_id}:channel")
+            self.pubsubs[room_id] = pubsub
+
+            async def redis_listener(room_id=room_id, pubsub=pubsub):
+                async for message in pubsub.listen():
+                    if message["type"] == "message":
+                        data = json.loads(message["data"])
+                        await self.broadcast(room_id, data)
+
+            self.redis_listener_tasks[room_id] = asyncio.create_task(redis_listener())
+
+    async def disconnect(self, room_id: int, websocket: WebSocket, username: str):
+        if room_id in self.local_connections:
+            self.local_connections[room_id] = [
+                ws for ws in self.local_connections[room_id] if ws != websocket
             ]
-            if not self.active_connections[room_id]:
-                del self.active_connections[room_id]
-    def get_usernames(self, room_id: int) -> list[str]:
-        if room_id not in self.active_connections:
-            return []
-        return [name for _, name in self.active_connections[room_id]]
+            if not self.local_connections[room_id]:
+                del self.local_connections[room_id]
+
+                # Plus personne dans le salon SUR CE PROCESS → arrête le listener
+                if room_id in self.redis_listener_tasks:
+                    self.redis_listener_tasks[room_id].cancel()
+                    del self.redis_listener_tasks[room_id]
+                if room_id in self.pubsubs:
+                    await self.pubsubs[room_id].unsubscribe(f"room:{room_id}:channel")
+                    del self.pubsubs[room_id]
+
+        await redis_client.srem(f"room:{room_id}:online", username)
+
+    async def get_usernames(self, room_id: int) -> list[str]:
+        members = await redis_client.smembers(f"room:{room_id}:online")
+        return list(members)
+
+    async def publish(self, room_id: int, message: dict):
+        await redis_client.publish(f"room:{room_id}:channel", json.dumps(message))
+
     async def broadcast(self, room_id: int, message: dict, exclude: WebSocket = None):
-        if room_id in self.active_connections:
+        if room_id in self.local_connections:
             dead_connections = []
-            for connection, username in self.active_connections[room_id]:
+            for connection in self.local_connections[room_id]:
                 if connection != exclude:
                     try:
                         await connection.send_json(message)
                     except Exception:
-                        dead_connections.append((connection, username))
-
-            # Nettoie les connexions mortes détectées pendant le broadcast
+                        dead_connections.append(connection)
             for dead in dead_connections:
-                self.active_connections[room_id].remove(dead)
+                self.local_connections[room_id].remove(dead)
 
 manager = ConnectionManager()
 #APP SETUP
@@ -227,63 +265,68 @@ async def refresh_access_token(body: RefreshRequest, session: Session = Depends(
 #WebSocket connexions
 
 @app.websocket("/ws/{room_id}")
-async def websocket_endpoint(websocket:WebSocket,room_id:int,token:str=Query(...),session:Session=Depends(get_session)):
+@app.websocket("/ws/{room_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: int, token: str = Query(...), session: Session = Depends(get_session)):
     try:
-        payload=jwt.decode(token,SECRET_KEY,algorithms=[ALGORITHM])
-        username=payload.get("sub")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
         if username is None:
-            await websocket.close(code=1008) #1008 policy violation
+            await websocket.close(code=1008)
             return
     except JWTError:
         await websocket.close(code=1008)
         return
-    
+
     user = session.exec(select(User).where(User.username == username)).first()
     if user is None:
         await websocket.close(code=1008)
         return
-    
+
     room = session.get(Room, room_id)
     if room is None:
         await websocket.close(code=1008)
         return
-    
-    await manager.connect(room_id, websocket,user.username)
-    await manager.broadcast(room_id, {
+
+    await manager.connect(room_id, websocket, user.username)
+
+    online_users = await manager.get_usernames(room_id)
+    await manager.publish(room_id, {
         "type": "user_joined",
         "username": user.username,
-        "online_users": manager.get_usernames(room_id),
+        "online_users": online_users,
     })
+
     try:
         while True:
-            raw=await websocket.receive_json()
+            raw = await websocket.receive_json()
             event_type = raw.get("type")
-            if event_type=="message":
-                content = raw.get("content", "")
 
-                #SAUVEGARDER MSG EN BD 
+            if event_type == "message":
+                content = raw.get("content", "")
                 new_message = Message(content=content, user_id=user.id, room_id=room_id)
                 session.add(new_message)
                 session.commit()
 
-                await manager.broadcast(room_id, {
+                await manager.publish(room_id, {
                     "type": "message",
                     "username": user.username,
                     "content": content,
                 })
             elif event_type == "typing":
-                await manager.broadcast(
-                    room_id,
-                    {"type": "typing", "username": user.username},
-                    exclude=websocket,
-                )
+                await manager.publish(room_id, {
+                    "type": "typing",
+                    "username": user.username,
+                })
     except WebSocketDisconnect:
-        manager.disconnect(room_id, websocket)
-        await manager.broadcast(room_id, {
+        pass
+    finally:
+        await manager.disconnect(room_id, websocket, user.username)
+        online_users = await manager.get_usernames(room_id)
+        await manager.publish(room_id, {
             "type": "user_left",
             "username": user.username,
-            "online_users": manager.get_usernames(room_id),
-        }) 
+            "online_users": online_users,
+        })
 
 # ROOM CRUD 
   
@@ -337,3 +380,8 @@ async def get_room_messages(
             room_id=m.room_id,
         ))
     return result
+@app.get("/redis-test")
+async def redis_test():
+    await redis_client.set("test_key", "hello upstash")
+    value = await redis_client.get("test_key")
+    return {"value": value}

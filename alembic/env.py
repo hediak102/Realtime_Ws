@@ -1,7 +1,7 @@
 from logging.config import fileConfig
 from sqlmodel import SQLModel
 from dotenv import load_dotenv
-from main import User, Room, Message
+from app.main import User, Room, Message
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 import os

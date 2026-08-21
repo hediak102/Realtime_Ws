@@ -1,7 +1,6 @@
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
-
 from app.db.session import get_session
 from app.api.auth import get_current_user
 from app.models.user import User

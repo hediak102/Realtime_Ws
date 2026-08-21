@@ -1,0 +1,22 @@
+services:
+  # Service 1: Serveur Redis
+  redis:
+    image: redis:7-alpine
+    container_name: realtime_redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  # Service 2: Backend FastAPI
+  web:
+    build: .
+    container_name: realtime_fastapi
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    volumes:
+      - .:/app  # Synchronise le code local pour le rechargement automatique en dev

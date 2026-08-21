@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 from main import app 
-from app.db import get_session
+from app.db.session import get_session
 def test_websocket_connect_success(session):
     # Note : utilise 'session' (sync), pas 'client' (async) pour ce test précis
     def get_session_override():

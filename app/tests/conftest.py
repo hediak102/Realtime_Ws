@@ -3,12 +3,11 @@ import pytest_asyncio
 from sqlmodel import SQLModel, Session, create_engine
 from sqlmodel.pool import StaticPool
 from httpx import AsyncClient, ASGITransport
+import fakeredis.aioredis
 
 from main import app
 from app.db.session import get_session
 from app.core.security import create_access_token
-from main import redis_client
-import fakeredis.aioredis
 
 # Base de données SQLite éphémère en mémoire RAM
 TEST_DATABASE_URL = "sqlite:///:memory:"
@@ -31,25 +30,24 @@ async def client_fixture(session: Session):
         return session
 
     app.dependency_overrides[get_session] = get_session_override
-    
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
-        
+
     app.dependency_overrides.clear()
 
 @pytest.fixture
 def auth_headers():
     token = create_access_token({"sub": "testuser"})
     return {"Authorization": f"Bearer {token}"}
-@pytest_asyncio.fixture(autouse=True)
-async def cleanup_redis():
-    yield
-    # S'exécute automatiquement après chaque test
-    await redis_client.flushall()
+
 @pytest_asyncio.fixture(autouse=True)
 async def use_fake_redis(monkeypatch):
     fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    monkeypatch.setattr("main.redis_client", fake_redis)
-    yield
+    monkeypatch.setattr("app.core.redis.redis_client", fake_redis)
+    monkeypatch.setattr("app.services.connection.redis_client", fake_redis)
+    yield fake_redis
+
     await fake_redis.flushall()
+    await fake_redis.aclose()

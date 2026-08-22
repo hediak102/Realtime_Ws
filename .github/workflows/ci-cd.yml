@@ -42,4 +42,4 @@ jobs:
     steps:
       - name: Trigger Deployment
         run: |
-          echo "Déploiement du backend déclenché pour la branche main."
+          curl -i -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"

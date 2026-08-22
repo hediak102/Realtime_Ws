@@ -50,7 +50,7 @@ async def websocket_endpoint(
 
             if event_type == "message":
                 content = raw.get("content", "")
-                temp_id = raw.get("tempId")  # Récupération de l'ID temporaire envoyé par React
+                temp_id = raw.get("tempId")
 
                 new_message = Message(content=content, user_id=user.id, room_id=room_id)
                 session.add(new_message)
@@ -60,11 +60,16 @@ async def websocket_endpoint(
                     "type": "message",
                     "username": user.username,
                     "content": content,
-                    "tempId": temp_id,  # Renvoie du tempId au client React
+                    "tempId": temp_id,
                 })
             elif event_type == "typing":
                 await manager.publish(room_id, {
                     "type": "typing",
+                    "username": user.username,
+                })
+            elif event_type == "stop_typing":
+                await manager.publish(room_id, {
+                    "type": "stop_typing",
                     "username": user.username,
                 })
     except WebSocketDisconnect:

@@ -5,8 +5,10 @@ from app.db.session import get_session
 from app.api.auth import get_current_user
 from app.models.user import User
 from app.models.room import Room, RoomCreate
-from app.models.message import Message, MessageRead
-
+from app.models.message import Message, MessageRead,MessagesPage
+from app.core.pagination import encode_cursor, decode_cursor
+from sqlalchemy import or_, and_
+from sqlalchemy.orm import joinedload
 # ---> AJOUTE OU VÉRIFIE CETTE LIGNE <---
 router = APIRouter(prefix="/rooms", tags=["Rooms"])
 
@@ -33,32 +35,55 @@ async def get_room(room_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="Room not found")
     return room
 
-@router.get("/{room_id}/messages", response_model=List[MessageRead])
+@router.get("/{room_id}/messages", response_model=MessagesPage)
 async def get_room_messages(
     room_id: int,
     session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-    skip: int = 0,
-    limit: int = 10,
+    limit: int = 20,
+    cursor: str | None = None,
 ):
     room = session.get(Room, room_id)
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
 
-    query = select(Message).where(Message.room_id == room_id).order_by(Message.created_at.desc()).offset(skip).limit(limit)
-    messages = session.exec(query).all()
-    messages.reverse()
-    
-    result = []
-    for m in messages:
-        author = session.get(User, m.user_id)
-        result.append(MessageRead(
-            id=m.id,
-            content=m.content,
-            created_at=m.created_at,
-            user_id=m.user_id,
-            username=author.username if author else "inconnu",
-            room_id=m.room_id,
-        ))
-    return result
+    # Requête simple sans joinedload
+    query = select(Message).where(Message.room_id == room_id)
 
+    if cursor:
+        cursor_created_at, cursor_id = decode_cursor(cursor)
+        query = query.where(
+            or_(
+                Message.created_at < cursor_created_at,
+                and_(Message.created_at == cursor_created_at, Message.id < cursor_id),
+            )
+        )
+
+    query = query.order_by(Message.created_at.desc(), Message.id.desc()).limit(limit + 1)
+    
+    messages_db = session.exec(query).all()
+
+    has_more = len(messages_db) > limit
+    messages_db = list(messages_db[:limit])
+    messages_db.reverse()
+
+    next_cursor = None
+    if has_more and messages_db:
+        oldest = messages_db[0]
+        next_cursor = encode_cursor(oldest.created_at, oldest.id)
+
+    # Récupération de l'utilisateur via session.get
+    result = []
+    for m in messages_db:
+        author = session.get(User, m.user_id)
+        result.append(
+            MessageRead(
+                id=m.id,
+                content=m.content,
+                created_at=m.created_at,
+                user_id=m.user_id,
+                username=author.username if author else "inconnu",
+                room_id=m.room_id,
+            )
+        )
+
+    return MessagesPage(messages=result, next_cursor=next_cursor, has_more=has_more)

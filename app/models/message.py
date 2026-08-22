@@ -1,5 +1,6 @@
 from datetime import datetime
 from sqlmodel import SQLModel, Field
+from typing import List, Optional
 
 class Message(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
@@ -15,3 +16,7 @@ class MessageRead(SQLModel):
     user_id: int
     username: str
     room_id: int
+class MessagesPage(SQLModel):
+    messages: List[MessageRead]
+    next_cursor: Optional[str] = None
+    has_more: bool

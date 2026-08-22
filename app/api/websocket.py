@@ -1,3 +1,4 @@
+import time
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, Depends
 from sqlmodel import Session, select
 from jose import jwt, JWTError
@@ -10,6 +11,9 @@ from app.models.message import Message
 from app.services.connection import manager
 
 router = APIRouter(tags=["WebSocket"])
+
+# Intervalle minimum entre 2 messages/actions (0.5s = max 2 actions par seconde)
+MIN_MESSAGE_INTERVAL = 0.5 
 
 @router.websocket("/ws/{room_id}")
 async def websocket_endpoint(
@@ -43,9 +47,26 @@ async def websocket_endpoint(
         "online_users": online_users,
     })
 
+    # Continuous tracker for rate limiting
+    last_message_time = 0.0
+
     try:
         while True:
             raw = await websocket.receive_json()
+            
+            # --- VÉRIFICATION DU RATE LIMITING ---
+            current_time = time.time()
+            if current_time - last_message_time < MIN_MESSAGE_INTERVAL:
+                # Alerte le client sans fermer la connexion et ignore le message
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Rate limit dépassé : vous envoyez des événements trop rapidement."
+                })
+                continue
+            
+            last_message_time = current_time
+            # -------------------------------------
+
             event_type = raw.get("type")
 
             if event_type == "message":

@@ -46,9 +46,14 @@ async def get_room_messages(
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
 
-    # Requête simple sans joinedload
-    query = select(Message).where(Message.room_id == room_id)
+    # Requête optimisée avec JOIN
+    query = (
+        select(Message, User)
+        .join(User, Message.user_id == User.id)
+        .where(Message.room_id == room_id)
+    )
 
+    # Filtrage par curseur
     if cursor:
         cursor_created_at, cursor_id = decode_cursor(cursor)
         query = query.where(
@@ -60,30 +65,32 @@ async def get_room_messages(
 
     query = query.order_by(Message.created_at.desc(), Message.id.desc()).limit(limit + 1)
     
-    messages_db = session.exec(query).all()
+    # Exec renvoie des tuples (Message, User)
+    rows = session.exec(query).all()
 
-    has_more = len(messages_db) > limit
-    messages_db = list(messages_db[:limit])
-    messages_db.reverse()
-
+    has_more = len(rows) > limit
+    rows = list(rows[:limit])
+    
+    # 1. Calcul du next_cursor AVANT d'inverser la liste (sur le message le plus ancien)
     next_cursor = None
-    if has_more and messages_db:
-        oldest = messages_db[0]
-        next_cursor = encode_cursor(oldest.created_at, oldest.id)
+    if has_more and rows:
+        oldest_message, _ = rows[-1]  # Le dernier élément du tableau temporaire est le plus ancien
+        next_cursor = encode_cursor(oldest_message.created_at, oldest_message.id)
 
-    # Récupération de l'utilisateur via session.get
-    result = []
-    for m in messages_db:
-        author = session.get(User, m.user_id)
-        result.append(
-            MessageRead(
-                id=m.id,
-                content=m.content,
-                created_at=m.created_at,
-                user_id=m.user_id,
-                username=author.username if author else "inconnu",
-                room_id=m.room_id,
-            )
+    # 2. Remettre les messages dans l'ordre chronologique (du plus ancien au plus récent)
+    rows.reverse()
+
+    # 3. Construction de la réponse DTO
+    result = [
+        MessageRead(
+            id=m.id,
+            content=m.content,
+            created_at=m.created_at,
+            user_id=m.user_id,
+            username=author.username if author else "inconnu",
+            room_id=m.room_id,
         )
+        for m, author in rows
+    ]
 
     return MessagesPage(messages=result, next_cursor=next_cursor, has_more=has_more)
